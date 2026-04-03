@@ -1,0 +1,23 @@
+parser:
+  pdf_backend: "pymupdf"
+
+chunker:
+  strategy: "recursive"
+  chunk_size: 2048
+  chunk_overlap: 256
+
+embedder:
+  provider: "local"                    # "local" | "openai"
+  model: "nomic-ai/nomic-embed-text-v1.5"
+  device: "cuda"                       # "cuda" | "cpu" | "auto"
+  dimensions: 768                      # can truncate for speed (Matryoshka)
+  batch_size: 64
+
+retriever:
+  backend: "cuvs"
+  algorithm: "cagra"                   # "cagra" | "ivf_pq" | "ivf_flat"
+  metric: "cosine"
+  top_k: 5
+  min_chunk_length: 128
+  index_path: "/data/indexes"
+  metadata_db: "/data/metadata.db"

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-system"
+version = "0.1.0"
+description = "GPU-accelerated document ingestion and retrieval system for NVIDIA DGX Spark"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.10",
+    "pyyaml>=6.0",
+    "typer>=0.15",
+    "rich>=13.0",
+    "sentence-transformers>=5.0",
+    "pymupdf>=1.25",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+api = ["openai>=1.50"]
+dev = ["pytest>=8.0", "ruff>=0.8"]
+
+[project.scripts]
+rag-system = "cli:app"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

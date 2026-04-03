@@ -1,0 +1,9 @@
+.git
+.env
+*.pyc
+__pycache__
+*.egg-info
+.ruff_cache
+.pytest_cache
+data/
+system_architecture.md
