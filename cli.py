@@ -137,16 +137,16 @@ def view(
     port: int = typer.Option(8501, "--port", "-p", help="Port to serve on"),
     verbose: bool = VERBOSE_OPTION,
 ) -> None:
-    """Launch the chunk viewer web UI."""
+    """Launch the chunk viewer web UI with semantic search."""
     _setup_logging(verbose)
-    settings = Settings.from_yaml(config)
-    db_path = str(settings.retriever.metadata_db)
+    pipeline = _load_pipeline(config)
+    db_path = str(pipeline._settings.retriever.metadata_db)
 
     from src.viewer import serve
 
     console.print(f"[bold green]Chunk viewer[/] running at [cyan]http://localhost:{port}[/]")
     console.print("Press Ctrl+C to stop.")
-    serve(db_path, port=port)
+    serve(db_path, port=port, pipeline=pipeline)
 
 
 if __name__ == "__main__":

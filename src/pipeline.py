@@ -20,7 +20,9 @@ class RAGPipeline:
         self._settings = settings
         self._parsers = self._build_parsers()
         self._chunker = self._build_chunker()
+        self._quality_filter = self._build_quality_filter()
         self._embedder = self._build_embedder()
+        self._reranker = self._build_reranker()
         self._retriever = self._build_retriever()
 
     def _build_parsers(self):
@@ -37,6 +39,11 @@ class RAGPipeline:
 
         return RecursiveChunker(self._settings.chunker)
 
+    def _build_quality_filter(self):
+        from src.chunkers.quality_filter import QualityFilter
+
+        return QualityFilter(self._settings.quality_filter)
+
     def _build_embedder(self):
         if self._settings.embedder.provider == EmbedderProvider.OPENAI:
             from src.embedders.api import APIEmbedder
@@ -46,6 +53,13 @@ class RAGPipeline:
             from src.embedders.local import LocalEmbedder
 
             return LocalEmbedder(self._settings.embedder)
+
+    def _build_reranker(self):
+        if not self._settings.reranker.enabled:
+            return None
+        from src.rerankers.cross_encoder import CrossEncoderReranker
+
+        return CrossEncoderReranker(self._settings.reranker)
 
     def _build_retriever(self):
         from src.retrievers.cuvs_retriever import CuVSRetriever
@@ -72,6 +86,7 @@ class RAGPipeline:
                 source_path=str(doc.source_path),
                 metadata=doc.metadata,
             )
+            chunks = self._quality_filter.filter(chunks)
             all_chunks.extend(chunks)
             logger.info("  %s -> %d chunks", file_path.name, len(chunks))
 
@@ -105,8 +120,15 @@ class RAGPipeline:
         self._retriever.load()
         self._retriever.build_index()
 
+        effective_k = top_k or self._settings.retriever.top_k
         query_embedding = self._embedder.embed_query(query)
-        results = self._retriever.search(query_embedding, top_k=top_k)
+
+        if self._reranker is not None:
+            fetch_k = effective_k * 4
+            candidates = self._retriever.search(query_embedding, top_k=fetch_k)
+            results = self._reranker.rerank(query, candidates, top_k=effective_k)
+        else:
+            results = self._retriever.search(query_embedding, top_k=effective_k)
         return results
 
     def _collect_files(self, path: Path) -> list[Path]:

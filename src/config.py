@@ -31,6 +31,19 @@ class EmbedderConfig(BaseModel):
     batch_size: int = Field(default=64, ge=1)
 
 
+class QualityFilterConfig(BaseModel):
+    enabled: bool = True
+    min_quality_score: float = Field(default=0.3, ge=0.0, le=1.0)
+    skip_references: bool = True
+    max_url_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class RerankerConfig(BaseModel):
+    enabled: bool = True
+    model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    device: Literal["cuda", "cpu", "auto"] = "cuda"
+
+
 class RetrieverAlgorithm(str, Enum):
     CAGRA = "cagra"
     IVF_PQ = "ivf_pq"
@@ -50,7 +63,9 @@ class RetrieverConfig(BaseModel):
 class Settings(BaseModel):
     parser: ParserConfig = ParserConfig()
     chunker: ChunkerConfig = ChunkerConfig()
+    quality_filter: QualityFilterConfig = QualityFilterConfig()
     embedder: EmbedderConfig = EmbedderConfig()
+    reranker: RerankerConfig = RerankerConfig()
     retriever: RetrieverConfig = RetrieverConfig()
 
     @classmethod

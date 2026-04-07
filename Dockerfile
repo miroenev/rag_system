@@ -34,11 +34,12 @@ COPY src/ src/
 # Install the project itself
 RUN pip install --no-cache-dir --no-deps .
 
-# Pre-download the default embedding model so the container runs fully offline
+# Pre-download models so the container runs fully offline
 RUN python -c "\
 import warnings; warnings.filterwarnings('ignore'); \
-from sentence_transformers import SentenceTransformer; \
-SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)"
+from sentence_transformers import SentenceTransformer, CrossEncoder; \
+SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True); \
+CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', trust_remote_code=True)"
 
 VOLUME ["/data"]
 

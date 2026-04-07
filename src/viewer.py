@@ -3,15 +3,21 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
+
+if TYPE_CHECKING:
+    from src.pipeline import RAGPipeline
 
 logger = logging.getLogger(__name__)
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
     db_path: str = ""
+    pipeline: RAGPipeline | None = None
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -52,6 +58,58 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self._handle_chunk_detail(chunk_id)
         else:
             self.send_error(404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/retrieve":
+            self._handle_retrieve()
+        else:
+            self.send_error(404)
+
+    def _handle_retrieve(self) -> None:
+        if self.pipeline is None:
+            self._json_response({"error": "Retrieval not available"}, status=503)
+            return
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            req = json.loads(body)
+        except json.JSONDecodeError:
+            self._json_response({"error": "Invalid JSON"}, status=400)
+            return
+
+        query = req.get("query", "").strip()
+        if not query:
+            self._json_response({"error": "Missing query"}, status=400)
+            return
+
+        top_k = int(req.get("top_k", 5))
+        try:
+            results = self.pipeline.retrieve(query, top_k=top_k)
+        except Exception:
+            logger.exception("Retrieval failed")
+            self._json_response(
+                {"error": "Retrieval failed", "detail": traceback.format_exc()},
+                status=500,
+            )
+            return
+
+        self._json_response({
+            "query": query,
+            "results": [
+                {
+                    "chunk_id": r.chunk_id,
+                    "score": round(r.score, 4),
+                    "text": r.text,
+                    "source_path": r.source_path,
+                    "chunk_index": r.chunk_index,
+                    "metadata": r.metadata,
+                    "text_length": len(r.text),
+                    "preview": r.text[:300],
+                }
+                for r in results
+            ],
+        })
 
     def _handle_stats(self) -> None:
         conn = self._connect()
@@ -147,8 +205,14 @@ class ViewerHandler(BaseHTTPRequestHandler):
         logger.debug(format, *args)
 
 
-def serve(db_path: str, host: str = "0.0.0.0", port: int = 8501) -> None:
+def serve(
+    db_path: str,
+    host: str = "0.0.0.0",
+    port: int = 8501,
+    pipeline: RAGPipeline | None = None,
+) -> None:
     ViewerHandler.db_path = db_path
+    ViewerHandler.pipeline = pipeline
     server = HTTPServer((host, port), ViewerHandler)
     logger.info("Chunk viewer running at http://%s:%d", host, port)
     try:
@@ -179,6 +243,7 @@ _VIEWER_HTML = """\
     --green: #4ade80;
     --amber: #fbbf24;
     --red: #f87171;
+    --purple: #a78bfa;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -198,6 +263,60 @@ _VIEWER_HTML = """\
     padding: 0.2rem 0.6rem; border-radius: 9999px;
   }
   .container { max-width: 1400px; margin: 0 auto; padding: 1.5rem 2rem; }
+
+  .query-bar {
+    background: var(--surface); border: 2px solid var(--border);
+    border-radius: 0.75rem; padding: 1rem 1.25rem;
+    margin-bottom: 1.5rem; display: flex; gap: 0.75rem; align-items: center;
+    transition: border-color 0.2s;
+  }
+  .query-bar:focus-within { border-color: var(--purple); }
+  .query-bar label {
+    font-size: 0.8rem; font-weight: 600; color: var(--purple);
+    white-space: nowrap;
+  }
+  .query-bar input {
+    flex: 1; background: transparent; border: none; color: var(--text);
+    font-size: 1rem; outline: none;
+  }
+  .query-bar input::placeholder { color: var(--text2); }
+  .query-bar .btn-retrieve {
+    background: var(--accent2); color: #fff; border: none;
+    padding: 0.5rem 1.25rem; border-radius: 0.5rem;
+    font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    transition: background 0.2s; white-space: nowrap;
+  }
+  .query-bar .btn-retrieve:hover { background: var(--accent); }
+  .query-bar .btn-retrieve:disabled { opacity: 0.5; cursor: default; }
+  .query-bar .btn-clear {
+    background: transparent; color: var(--text2); border: 1px solid var(--border);
+    padding: 0.5rem 1rem; border-radius: 0.5rem;
+    font-size: 0.85rem; cursor: pointer; transition: border-color 0.2s;
+    display: none;
+  }
+  .query-bar .btn-clear:hover { border-color: var(--red); color: var(--red); }
+  .query-bar .btn-clear.visible { display: inline-block; }
+
+  .retrieve-status {
+    text-align: center; padding: 2rem; color: var(--text2); display: none;
+  }
+  .retrieve-status.visible { display: block; }
+  .retrieve-status .spinner {
+    display: inline-block; width: 20px; height: 20px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.8s linear infinite;
+    margin-right: 0.5rem; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .result-header {
+    display: none; margin-bottom: 1rem;
+    padding: 0.75rem 1rem; background: rgba(167,139,250,0.08);
+    border: 1px solid rgba(167,139,250,0.2); border-radius: 0.5rem;
+  }
+  .result-header.visible { display: flex; align-items: center; justify-content: space-between; }
+  .result-header .rh-query { color: var(--purple); font-weight: 600; }
+  .result-header .rh-count { color: var(--text2); font-size: 0.85rem; }
 
   .stats-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -236,6 +355,11 @@ _VIEWER_HTML = """\
     background: rgba(108,138,255,0.1); padding: 0.25rem 0.5rem;
     border-radius: 0.375rem; text-align: center;
   }
+  .chunk-rank {
+    font-size: 0.8rem; font-weight: 600; color: var(--purple);
+    background: rgba(167,139,250,0.1); padding: 0.25rem 0.5rem;
+    border-radius: 0.375rem; text-align: center;
+  }
   .chunk-preview {
     font-size: 0.875rem; color: var(--text2);
     overflow: hidden; display: -webkit-box;
@@ -257,6 +381,10 @@ _VIEWER_HTML = """\
   }
   .chunk-meta .loc {
     color: var(--text2); margin-top: 2px;
+  }
+  .chunk-meta .score {
+    color: var(--purple); font-weight: 700; font-size: 0.85rem;
+    margin-top: 4px;
   }
 
   .detail-panel {
@@ -294,6 +422,9 @@ _VIEWER_HTML = """\
   .detail-meta .dm-loc {
     color: var(--accent); font-family: monospace; font-size: 0.8rem;
   }
+  .detail-meta .dm-score {
+    color: var(--purple); font-weight: 700; font-size: 1rem;
+  }
   .detail-text {
     flex: 1; padding: 1.25rem; overflow-y: auto;
     font-size: 0.9rem; line-height: 1.8; white-space: pre-wrap;
@@ -329,10 +460,26 @@ _VIEWER_HTML = """\
 </div>
 
 <div class="container">
+  <div class="query-bar">
+    <label>Semantic Search</label>
+    <input type="text" id="query-input" placeholder="Ask a question to retrieve relevant chunks...">
+    <button class="btn-retrieve" id="btn-retrieve" onclick="doRetrieve()">Retrieve</button>
+    <button class="btn-clear" id="btn-clear" onclick="clearRetrieve()">Clear</button>
+  </div>
+
+  <div class="retrieve-status" id="retrieve-status">
+    <span class="spinner"></span> Searching...
+  </div>
+
+  <div class="result-header" id="result-header">
+    <span class="rh-query" id="rh-query"></span>
+    <span class="rh-count" id="rh-count"></span>
+  </div>
+
   <div class="stats-grid" id="stats"></div>
 
-  <div class="controls">
-    <input type="text" id="search" placeholder="Search chunk text...">
+  <div class="controls" id="browse-controls">
+    <input type="text" id="search" placeholder="Filter chunk text...">
     <select id="source-filter"><option value="">All sources</option></select>
   </div>
 
@@ -354,6 +501,8 @@ _VIEWER_HTML = """\
 const PAGE_SIZE = 50;
 let currentOffset = 0;
 let searchTimeout = null;
+let retrieveMode = false;
+let retrieveResults = null;
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -427,6 +576,112 @@ function renderChunks(data) {
   `;
 }
 
+function renderRetrieveResults(data) {
+  const list = document.getElementById('chunk-list');
+  if (!data.results || data.results.length === 0) {
+    list.innerHTML = '<div class="empty">No results found for this query.</div>';
+    document.getElementById('pagination').innerHTML = '';
+    return;
+  }
+  list.innerHTML = data.results.map((r, i) => {
+    const section = (r.metadata || {}).section || '';
+    const start = (r.metadata || {}).start_char;
+    const end = (r.metadata || {}).end_char;
+    const hasLoc = start !== undefined && end !== undefined;
+    return `
+    <div class="chunk-row" onclick="openRetrieveDetail(${i})">
+      <div class="chunk-rank">#${i + 1}</div>
+      <div class="chunk-preview">${escHtml(r.preview)}</div>
+      <div class="chunk-meta">
+        <div class="source">${r.source_path.split('/').pop()}</div>
+        ${section ? '<div class="section">&sect; ' + escHtml(section) + '</div>' : ''}
+        <div class="loc">${hasLoc ? 'chars ' + start + '-' + end + ' &middot; ' : ''}${r.text_length} chars</div>
+        <div class="score">score: ${r.score.toFixed(4)}</div>
+      </div>
+    </div>`;
+  }).join('');
+  document.getElementById('pagination').innerHTML = '';
+}
+
+async function doRetrieve() {
+  const query = document.getElementById('query-input').value.trim();
+  if (!query) return;
+
+  const btn = document.getElementById('btn-retrieve');
+  const status = document.getElementById('retrieve-status');
+  btn.disabled = true;
+  status.classList.add('visible');
+  document.getElementById('chunk-list').innerHTML = '';
+  document.getElementById('pagination').innerHTML = '';
+
+  document.getElementById('stats').style.display = 'none';
+  document.getElementById('browse-controls').style.display = 'none';
+
+  try {
+    const r = await fetch('/api/retrieve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({query, top_k: 10}),
+    });
+    const data = await r.json();
+    if (data.error) {
+      document.getElementById('chunk-list').innerHTML =
+        '<div class="empty" style="color:var(--red)">Error: ' + escHtml(data.error) + '</div>';
+    } else {
+      retrieveMode = true;
+      retrieveResults = data;
+      document.getElementById('btn-clear').classList.add('visible');
+      const rh = document.getElementById('result-header');
+      rh.classList.add('visible');
+      document.getElementById('rh-query').textContent = data.query;
+      document.getElementById('rh-count').textContent = data.results.length + ' results';
+      renderRetrieveResults(data);
+    }
+  } catch (err) {
+    document.getElementById('chunk-list').innerHTML =
+      '<div class="empty" style="color:var(--red)">Request failed: ' + escHtml(err.message) + '</div>';
+  } finally {
+    btn.disabled = false;
+    status.classList.remove('visible');
+  }
+}
+
+function clearRetrieve() {
+  retrieveMode = false;
+  retrieveResults = null;
+  document.getElementById('query-input').value = '';
+  document.getElementById('btn-clear').classList.remove('visible');
+  document.getElementById('result-header').classList.remove('visible');
+  document.getElementById('stats').style.display = '';
+  document.getElementById('browse-controls').style.display = '';
+  loadChunks();
+}
+
+function openRetrieveDetail(idx) {
+  if (!retrieveResults) return;
+  const r = retrieveResults.results[idx];
+  document.getElementById('detail-title').textContent = 'Result #' + (idx + 1);
+  const m = r.metadata || {};
+  const section = m.section || '';
+  const start = m.start_char;
+  const end = m.end_char;
+  let metaHtml = '';
+  metaHtml += `<div class="dm-row"><span class="dm-label">Score</span><span class="dm-score">${r.score.toFixed(4)}</span></div>`;
+  if (section) {
+    metaHtml += `<div class="dm-section">&sect; ${escHtml(section)}</div>`;
+  }
+  metaHtml += `<div class="dm-row"><span class="dm-label">Source</span><span class="dm-value">${escHtml(r.source_path)}</span></div>`;
+  if (start !== undefined && end !== undefined) {
+    metaHtml += `<div class="dm-row"><span class="dm-label">Location</span><span class="dm-loc">chars ${start} &ndash; ${end}</span></div>`;
+  }
+  metaHtml += `<div class="dm-row"><span class="dm-label">Chunk Index</span><span class="dm-value">${r.chunk_index}</span></div>`;
+  metaHtml += `<div class="dm-row"><span class="dm-label">Length</span><span class="dm-value">${r.text_length} chars</span></div>`;
+  document.getElementById('detail-meta').innerHTML = metaHtml;
+  document.getElementById('detail-text').textContent = r.text;
+  document.getElementById('detail').classList.add('open');
+  document.getElementById('overlay').classList.add('open');
+}
+
 async function openDetail(id) {
   const c = await fetchJSON('/api/chunks/' + id);
   document.getElementById('detail-title').textContent = 'Chunk #' + c.id;
@@ -473,6 +728,9 @@ document.getElementById('search').addEventListener('input', () => {
   searchTimeout = setTimeout(() => { currentOffset = 0; loadChunks(); }, 300);
 });
 document.getElementById('source-filter').addEventListener('change', () => { currentOffset = 0; loadChunks(); });
+document.getElementById('query-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doRetrieve();
+});
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
 
 loadStats();

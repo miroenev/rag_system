@@ -165,7 +165,10 @@ class CuVSRetriever(BaseRetriever):
         import cupy as cp
 
         query_gpu = cp.asarray(query.reshape(1, -1))
-        search_params = cagra.SearchParams()
+        sp_kwargs = {}
+        if top_k > 64:
+            sp_kwargs["itopk_size"] = max(top_k, 128)
+        search_params = cagra.SearchParams(**sp_kwargs)
         distances, indices = cagra.search(search_params, self._cuvs_index, query_gpu, top_k)
         return cp.asnumpy(cp.asarray(indices))[0], cp.asnumpy(cp.asarray(distances))[0]
 
