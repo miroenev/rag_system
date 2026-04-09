@@ -48,7 +48,6 @@ class CrossEncoderReranker(BaseReranker):
                     self._config.model,
                     device=device,
                     trust_remote_code=True,
-                    local_files_only=True,
                 )
         finally:
             os.dup2(fd, 2)
