@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +13,16 @@ from src.parsers.base import ParsedDocument
 from src.retrievers.base import RetrievalResult
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _phase(name: str, timings: dict[str, float]):
+    """Record wall-clock duration for a named phase into the timings dict."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[name] = time.perf_counter() - start
 
 
 class RAGPipeline:
@@ -74,27 +86,47 @@ class RAGPipeline:
 
     def ingest(self, input_path: str | Path) -> int:
         """Ingest documents from a file or directory. Returns number of chunks indexed."""
+        t0 = time.perf_counter()
+        timings: dict[str, float] = {}
+
         input_path = Path(input_path)
-        files = self._collect_files(input_path)
+        with _phase("collect", timings):
+            files = self._collect_files(input_path)
         if not files:
             logger.warning("No supported files found at %s", input_path)
             return 0
 
         logger.info("Found %d files to ingest", len(files))
         all_chunks: list[Chunk] = []
+        parse_s = 0.0
+        chunk_s = 0.0
+        filter_s = 0.0
 
         for file_path in files:
+            t_parse = time.perf_counter()
             doc = self._parse_file(file_path)
+            parse_s += time.perf_counter() - t_parse
             if doc is None:
                 continue
+
+            t_chunk = time.perf_counter()
             chunks = self._chunker.chunk(
                 doc.content,
                 source_path=str(doc.source_path),
                 metadata=doc.metadata,
             )
+            chunk_s += time.perf_counter() - t_chunk
+
+            t_filter = time.perf_counter()
             chunks = self._quality_filter.filter(chunks)
+            filter_s += time.perf_counter() - t_filter
+
             all_chunks.extend(chunks)
             logger.info("  %s -> %d chunks", file_path.name, len(chunks))
+
+        timings["parse"] = parse_s
+        timings["chunk"] = chunk_s
+        timings["filter"] = filter_s
 
         if not all_chunks:
             logger.warning("No chunks produced from %d files", len(files))
@@ -102,7 +134,8 @@ class RAGPipeline:
 
         texts = [c.text for c in all_chunks]
         logger.info("Embedding %d chunks...", len(texts))
-        embeddings = self._embed_batched(texts)
+        with _phase("embed", timings):
+            embeddings = self._embed_batched(texts)
 
         chunk_dicts = [
             {
@@ -114,28 +147,64 @@ class RAGPipeline:
             for c in all_chunks
         ]
 
-        self._retriever.add(embeddings, chunk_dicts)
-        self._retriever.build_index()
-        self._retriever.save()
+        with _phase("index_add", timings):
+            self._retriever.add(embeddings, chunk_dicts)
+        with _phase("index_build", timings):
+            self._retriever.build_index()
+        with _phase("index_save", timings):
+            self._retriever.save()
 
-        logger.info("Ingested %d chunks from %d files", len(all_chunks), len(files))
+        total = time.perf_counter() - t0
+        rate = len(all_chunks) / total if total > 0 else 0.0
+        logger.info(
+            "Ingested %d chunks from %d files in %.2fs (%.1f chunks/s)",
+            len(all_chunks), len(files), total, rate,
+        )
+        self._log_timings("ingest", timings, total, extra=f"{len(all_chunks)} chunks")
         return len(all_chunks)
 
     def retrieve(self, query: str, top_k: int | None = None) -> list[RetrievalResult]:
         """Retrieve the most relevant chunks for a query."""
-        self._retriever.load()
-        self._retriever.build_index()
+        t0 = time.perf_counter()
+        timings: dict[str, float] = {}
+
+        with _phase("load", timings):
+            self._retriever.load()
+        with _phase("index_build", timings):
+            self._retriever.build_index()
 
         effective_k = top_k or self._settings.retriever.top_k
-        query_embedding = self._embedder.embed_query(query)
+        with _phase("embed_query", timings):
+            query_embedding = self._embedder.embed_query(query)
 
         if self._reranker is not None:
             fetch_k = effective_k * 4
-            candidates = self._retriever.search(query_embedding, top_k=fetch_k)
-            results = self._reranker.rerank(query, candidates, top_k=effective_k)
+            with _phase("search", timings):
+                candidates = self._retriever.search(query_embedding, top_k=fetch_k)
+            with _phase("rerank", timings):
+                results = self._reranker.rerank(query, candidates, top_k=effective_k)
         else:
-            results = self._retriever.search(query_embedding, top_k=effective_k)
+            with _phase("search", timings):
+                results = self._retriever.search(query_embedding, top_k=effective_k)
+
+        total = time.perf_counter() - t0
+        self._log_timings("retrieve", timings, total, extra=f"{len(results)} results")
         return results
+
+    @staticmethod
+    def _log_timings(op: str, timings: dict[str, float], total: float, extra: str = "") -> None:
+        """Emit one INFO line per phase and a summary."""
+        tag = f" [{extra}]" if extra else ""
+        logger.info("Timing breakdown for %s%s (total %.2fs):", op, tag, total)
+        tracked = 0.0
+        for name, dt in timings.items():
+            pct = (dt / total * 100.0) if total > 0 else 0.0
+            logger.info("  %-12s %7.3fs  (%4.1f%%)", name, dt, pct)
+            tracked += dt
+        other = max(total - tracked, 0.0)
+        if other > 0.01:
+            pct = (other / total * 100.0) if total > 0 else 0.0
+            logger.info("  %-12s %7.3fs  (%4.1f%%)", "other", other, pct)
 
     def _collect_files(self, path: Path) -> list[Path]:
         if path.is_file():
