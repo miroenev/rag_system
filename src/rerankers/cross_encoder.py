@@ -33,8 +33,7 @@ class CrossEncoderReranker(BaseReranker):
 
         device = self._config.device
         if device == "auto":
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = "cpu"
 
         logger.info("Loading reranker model %s on %s", self._config.model, device)
         fd = os.dup(2)

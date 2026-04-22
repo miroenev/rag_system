@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class LocalEmbedder(BaseEmbedder):
-    """GPU-accelerated embeddings via sentence-transformers."""
+    """CPU embeddings via sentence-transformers."""
 
     def __init__(self, config: EmbedderConfig) -> None:
         self._config = config
@@ -29,8 +29,7 @@ class LocalEmbedder(BaseEmbedder):
 
         device = self._config.device
         if device == "auto":
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = "cpu"
 
         logger.info("Loading embedding model %s on %s", self._config.model, device)
         fd = os.dup(2)

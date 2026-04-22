@@ -13,7 +13,7 @@ from src.pipeline import RAGPipeline
 
 app = typer.Typer(
     name="rag-system",
-    help="GPU-accelerated document ingestion and retrieval for DGX Spark.",
+    help="CPU-only document ingestion and retrieval (cloud VM).",
     add_completion=False,
 )
 console = Console()

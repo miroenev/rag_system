@@ -12,7 +12,7 @@ class MetadataStore:
     """SQLite-backed store for chunk text and metadata.
 
     Each chunk gets a monotonically increasing integer ID that serves as the
-    foreign key into the cuVS vector index.
+    foreign key into the vector index.
     """
 
     def __init__(self, db_path: str | Path) -> None:

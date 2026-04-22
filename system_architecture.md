@@ -1,57 +1,70 @@
-# RAG System Architecture
+# RAG System Architecture (CPU-only)
 
-A GPU-accelerated document ingestion and retrieval system targeting NVIDIA DGX Spark.
+A CPU-only document ingestion and retrieval system designed to run in a modest cloud VM. This is the `cpu-only` branch fork of the DGX Spark GPU version on `main`.
 
 ## Scope
 
 This system handles **document ingestion** (parse, chunk, embed, index) and **retrieval** (embed query, search, return ranked chunks with metadata). LLM generation is explicitly **out of scope** -- it happens in a separate container (e.g. vLLM, Ollama) or via remote API calls. This system's output is a set of retrieved chunks with scores and source metadata, ready to be passed to any LLM.
 
-## Target Platform: NVIDIA DGX Spark
+## Target Platform: Cloud VM
 
-The system runs exclusively inside a single container on DGX Spark:
+The system runs inside a single container on a general-purpose cloud VM with **no GPU required**.
 
-| Spec | Detail |
-|------|--------|
-| **SoC** | NVIDIA GB10 Grace Blackwell Superchip |
-| **GPU** | Blackwell architecture (sm_121), up to 1 PFLOP FP4 |
-| **CPU** | 20-core ARM (aarch64) -- 10x Cortex-X925 + 10x Cortex-A725 |
-| **Memory** | 128 GB LPDDR5x unified memory (shared CPU/GPU, 273 GB/s) |
-| **Storage** | 4 TB NVMe |
-| **CUDA** | 13.x |
-| **Container** | NVIDIA Container Runtime for Docker (pre-installed) |
+| Spec | Minimum | Recommended |
+|------|---------|-------------|
+| CPU | 4 vCPU (x86_64 or arm64) | 8 vCPU |
+| Memory | 8 GB | 16 GB |
+| Storage | 20 GB | 50 GB (NVMe) |
+| OS | Linux with Docker | Linux with Docker |
+| Python | 3.11+ (via container) | 3.11+ (via container) |
 
-The unified memory architecture means there is no PCIe bottleneck between CPU and GPU -- data lives in one address space. This makes in-process GPU libraries (cuVS, sentence-transformers) especially efficient since there is no device-to-host copy overhead.
+No CUDA drivers, no NVIDIA Container Toolkit, no `--gpus all` needed.
+
+### Performance expectations
+
+On an 8 vCPU VM with the default `nomic-embed-text-v1.5` (137M params, 768-dim):
+
+| Operation | Throughput / latency |
+|-----------|----------------------|
+| Embedding (ingest) | ~50-200 chunks/s |
+| Query embedding | ~50-150 ms |
+| FAISS flat search | <50 ms for up to ~500k chunks |
+| Cross-encoder rerank (20 candidates) | ~200-500 ms |
+
+For larger corpora (>500k chunks) switch `retriever.algorithm` from `flat` to `hnsw`.
 
 ## Architecture Overview
 
 ```mermaid
 flowchart TB
-    subgraph container ["Single Container (DGX Spark)"]
+    subgraph container ["Single Container (Cloud VM)"]
         subgraph ingestion [Ingestion Pipeline]
             docs["PDF / Markdown Files"]
-            parser["Parser (Docling, GPU)"]
+            parser["Parser (PyMuPDF, CPU)"]
             chunker["Chunker (recursive)"]
-            embedder["Embedder (sentence-transformers, GPU)"]
-            docs --> parser --> chunker --> embedder
+            qfilter["Quality Filter"]
+            embedder["Embedder (sentence-transformers, CPU torch)"]
+            docs --> parser --> chunker --> qfilter --> embedder
         end
 
         subgraph storage [Storage Layer]
-            cuvs_idx["cuVS CAGRA Index (GPU)"]
+            faissIdx["FAISS Flat / HNSW Index (CPU)"]
             sqlite["SQLite (metadata + chunks)"]
         end
 
         subgraph retrievalPipe [Retrieval Pipeline]
             userQuery["User Query"]
-            queryEmbed["Embedder (GPU)"]
-            retriever["cuVS Search (GPU)"]
+            queryEmbed["Embedder (CPU)"]
+            retriever["FAISS Search (CPU)"]
+            reranker["Cross-Encoder Rerank (CPU)"]
             metaLookup["Metadata Lookup"]
             results["Ranked Chunks + Sources"]
-            userQuery --> queryEmbed --> retriever --> metaLookup --> results
+            userQuery --> queryEmbed --> retriever --> reranker --> metaLookup --> results
         end
 
-        embedder --> cuvs_idx
+        embedder --> faissIdx
         embedder --> sqlite
-        cuvs_idx --> retriever
+        faissIdx --> retriever
         sqlite --> metaLookup
     end
 
@@ -65,115 +78,130 @@ flowchart TB
     end
     configLayer -.-> container
 
-    disk[("NVMe Storage (4TB)")] --> docs
-    disk --> cuvs_idx
+    disk[("Volume /data")] --> docs
+    disk --> faissIdx
     disk --> sqlite
 ```
 
 ## Component Selection
 
-### Document Parsing -- Docling
+### Document Parsing -- PyMuPDF
 
-[Docling](https://github.com/docling-project/docling) (IBM Research). GPU-accelerated (up to 6x speedup on Blackwell). Outputs structured Markdown/JSON from PDFs. Handles tables, images, OCR. Markdown files parsed natively. Configurable batch sizes for OCR and layout detection.
+[PyMuPDF](https://pymupdf.readthedocs.io/) (fitz) for fast CPU text extraction from PDFs. Markdown files parsed natively.
 
-### Embeddings -- sentence-transformers
+### Embeddings -- sentence-transformers (CPU torch)
 
-[sentence-transformers](https://github.com/huggingface/sentence-transformers) (v5.3). 15,000+ pre-trained models on HuggingFace, full CUDA support. The NGC PyTorch base image already includes PyTorch with CUDA -- sentence-transformers layers directly on top. Also supports OpenAI-compatible embeddings API as a config option.
+[sentence-transformers](https://github.com/huggingface/sentence-transformers) on top of CPU PyTorch. 15,000+ pre-trained models on HuggingFace. The container installs the official `torch` wheel from `https://download.pytorch.org/whl/cpu`, which has no CUDA runtime.
 
 ### Embedding Model Tradeoffs
 
-With 128 GB unified memory on DGX Spark, even the largest open models fit comfortably. The key tradeoffs are **retrieval quality vs. latency vs. licensing**:
+The default is `nomic-ai/nomic-embed-text-v1.5` -- same model as the GPU branch, so retrieval quality is unchanged. On CPU, smaller / lower-dim models are significantly faster if quality can be traded off:
 
-| Model | Params | Dims | MTEB | Context | License | Memory | Notes |
-|-------|--------|------|------|---------|---------|--------|-------|
-| all-MiniLM-L6-v2 | 22M | 384 | 56.3 | 512 | Apache 2.0 | <1 GB | Legacy baseline, very fast, low quality |
-| nomic-embed-text-v1.5 | 137M | 768 | ~62 | 8192 | Apache 2.0 | ~1 GB | **Recommended default.** Matryoshka support |
-| BGE-M3 (BAAI) | 568M | 1024 | 63.0 | 8192 | MIT | ~2 GB | Multilingual, hybrid retrieval |
-| snowflake-arctic-embed-l | 335M | 1024 | 64.2 | 512 | Apache 2.0 | ~1.5 GB | Retrieval-focused, shorter context |
-| Qwen3-Embedding-0.6B | 600M | flex | ~65 | 32K | Apache 2.0 | ~2 GB | Instruction-aware, long context |
-| NV-Embed-v2 | 7.8B | 4096 | 72.3 | 32K | CC-BY-NC-4.0 | ~16 GB | Best retrieval, **non-commercial** |
-| Qwen3-Embedding-8B | 8B | 7168 | 70.6 | 32K | Apache 2.0 | ~16 GB | Top permissive-license option |
+| Model | Params | Dims | MTEB | License | CPU notes |
+|-------|--------|------|------|---------|-----------|
+| all-MiniLM-L6-v2 | 22M | 384 | 56.3 | Apache 2.0 | Fastest, lowest quality |
+| bge-small-en-v1.5 | 33M | 384 | 62.2 | MIT | Great speed/quality tradeoff |
+| nomic-embed-text-v1.5 | 137M | 768 | ~62 | Apache 2.0 | **Default.** 8k context, Matryoshka |
+| bge-base-en-v1.5 | 109M | 768 | 63.6 | MIT | Comparable to nomic |
 
-**Recommended default**: `nomic-embed-text-v1.5` -- best balance of quality, speed, memory, long context, and permissive license. Upgrade path to Qwen3-Embedding-0.6B or 8B via config change.
+Swap by editing `embedder.model` in `config/default.yaml`; no code changes needed.
 
-### Vector Search -- cuVS (RAPIDS)
+### Vector Search -- FAISS (CPU)
 
-[cuVS](https://github.com/rapidsai/cuvs) (NVIDIA RAPIDS). GPU-accelerated vector search library. Runs in-process (no separate server), ideal for single-container DGX Spark deployment.
+[FAISS](https://github.com/facebookresearch/faiss) (Meta) via `faiss-cpu`. Runs in-process, no separate server.
 
-Advantages over a separate vector DB (Qdrant/Milvus):
-- **Full GPU acceleration**: Builds indexes up to 12x faster, search latency up to 8x lower at 95% recall
-- **No extra container/process**: Everything runs in one container, sharing unified memory
-- **Algorithms**: CAGRA (graph-based, best quality/speed), IVF-PQ (memory-efficient for large collections), IVF-Flat, brute-force
-- **Persistence**: Indexes serialize to disk via `cagra.save()` / `cagra.load()`
+Two backends are available:
 
-Since cuVS is a pure search library (no metadata filtering, no document storage), it is paired with SQLite for chunk metadata and source tracking:
+| `retriever.backend` | `retriever.algorithm` | FAISS index | When to use |
+|---------------------|-----------------------|-------------|-------------|
+| `faiss` (default) | `flat` | `IndexFlatIP` / `IndexFlatL2` | Exact search, works great up to ~500k vectors |
+| `faiss` | `hnsw` | `IndexHNSWFlat` | Approximate but fast for millions of vectors |
+| `numpy` | (ignored) | (none, brute force) | Minimal fallback, no FAISS dep, tiny corpora |
 
 ```mermaid
 flowchart LR
-    query["Query Vector"] --> cuVS["cuVS CAGRA Index (GPU)"]
-    cuVS -->|"top-k IDs + distances"| meta["SQLite Metadata"]
+    query["Query Vector"] --> faiss["FAISS IndexFlatIP (CPU)"]
+    faiss -->|"top-k IDs + scores"| meta["SQLite Metadata"]
     meta -->|"chunk text + source info"| results["Ranked Results"]
 ```
 
+### Reranker -- Cross-Encoder (CPU)
+
+[cross-encoder/ms-marco-MiniLM-L-6-v2](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2) (22M params) runs on CPU torch. Applied only to a small candidate set (top 20-40 from FAISS) so total rerank latency stays under ~500 ms.
+
 ### Config Management -- YAML + Pydantic
 
-All behavior (model names, chunk sizes, index algorithm, retrieval params) lives in YAML config validated by Pydantic models. Zero code changes needed to switch models or parameters.
+All behavior (model names, chunk sizes, retriever backend, retrieval params) lives in YAML config validated by Pydantic models. Zero code changes needed to switch models or parameters.
+
+## Storage Layer Portability
+
+The on-disk storage format is intentionally compatible with the GPU (`main`) branch so indexes can be shared or migrated without re-embedding:
+
+| Artifact | Portable across branches? | Notes |
+|----------|---------------------------|-------|
+| `metadata.db` (SQLite) | Yes | Schema is backend-agnostic |
+| `vectors.npy` | Yes | Raw float32 embedding matrix |
+| `id_map.npy` | Yes | Row-index to chunk-id mapping |
+| `faiss.index` | CPU branch only | Rebuilt from `vectors.npy` if missing |
+| `cagra.index` | GPU branch only | Ignored on CPU branch |
+
+When the CPU branch loads an index directory that contains `vectors.npy` but no `faiss.index`, it rebuilds the FAISS index in memory on `build_index()`. This means you can copy `/data` from a GPU machine to a CPU VM and start serving immediately with no re-embedding.
 
 ## Container Image Strategy
 
 ```mermaid
 flowchart TB
-    base["nvcr.io/nvidia/pytorch:26.03-py3"]
-    base -->|"already includes"| included["PyTorch, CUDA 13.x, cuDNN, NCCL, Python 3.x, Ubuntu 24.04, ARM64"]
-    base -->|"pip install"| cuvs["cuvs-cu13 (from pypi.nvidia.com)"]
-    base -->|"pip install"| appDeps["sentence-transformers, docling, pydantic, pyyaml, typer, rich"]
-    base -->|"apt-get"| sysDeps["poppler-utils, tesseract-ocr, libsqlite3-dev"]
-    cuvs --> final["Final Image"]
+    base["python:3.11-slim-bookworm"]
+    base -->|"pip install"| torchCpu["torch (CPU wheel from download.pytorch.org/whl/cpu)"]
+    base -->|"pip install"| appDeps["sentence-transformers, faiss-cpu, pymupdf, pydantic, pyyaml, typer, rich, numpy"]
+    base -->|"apt-get"| sysDeps["libsqlite3-dev, build-essential"]
+    torchCpu --> final["Final Image (~1-2 GB)"]
     appDeps --> final
     sysDeps --> final
 ```
 
-Why `nvcr.io/nvidia/pytorch:26.03-py3`:
-- Ships with PyTorch + CUDA 13.x pre-built and optimized for NVIDIA hardware (including ARM64/aarch64)
-- Eliminates the most fragile part of the build: matching PyTorch wheels to CUDA/cuDNN versions
-- sentence-transformers and Docling both depend on PyTorch, so this gets them running immediately
-- cuVS installs cleanly via `pip install cuvs-cu13 --extra-index-url=https://pypi.nvidia.com` on top
+Why `python:3.11-slim-bookworm`:
+- Tiny base (~150 MB) vs multi-GB NGC PyTorch
+- No CUDA libraries shipped, so the final image is cloud-VM-sized
+- Works on both x86_64 and arm64 hosts without modification
 
 ## Project Structure
 
 ```
 rag_system/
-├── ARCHITECTURE.md               # This document
-├── config/
-│   └── default.yaml              # All pipeline settings
-├── src/
-│   ├── __init__.py
-│   ├── config.py                 # Pydantic config models
-│   ├── parsers/
-│   │   ├── __init__.py
-│   │   ├── base.py               # Abstract parser interface
-│   │   ├── pdf_parser.py         # Docling GPU-accelerated
-│   │   └── markdown_parser.py    # Native markdown parsing
-│   ├── chunkers/
-│   │   ├── __init__.py
-│   │   ├── base.py
-│   │   └── recursive.py          # Recursive text splitter
-│   ├── embedders/
-│   │   ├── __init__.py
-│   │   ├── base.py
-│   │   ├── local.py              # sentence-transformers (GPU)
-│   │   └── api.py                # OpenAI-compatible API
-│   ├── retrievers/
-│   │   ├── __init__.py
-│   │   ├── base.py
-│   │   ├── cuvs_retriever.py     # cuVS CAGRA/IVF-PQ + SQLite
-│   │   └── metadata_store.py     # SQLite metadata/chunk store
-│   └── pipeline.py               # Orchestrates ingest + retrieve
-├── cli.py                        # CLI entry point (ingest / retrieve)
-├── Dockerfile                    # Based on NGC PyTorch + cuVS
-├── pyproject.toml                # Dependencies + project metadata
-├── .env.example                  # API keys template (for embeddings API)
-└── README.md
+|-- system_architecture.md        # This document
+|-- config/
+|   `-- default.yaml              # All pipeline settings
+|-- src/
+|   |-- __init__.py
+|   |-- config.py                 # Pydantic config models
+|   |-- parsers/
+|   |   |-- base.py
+|   |   |-- pdf_parser.py         # PyMuPDF
+|   |   `-- markdown_parser.py
+|   |-- chunkers/
+|   |   |-- base.py
+|   |   |-- recursive.py
+|   |   `-- quality_filter.py
+|   |-- embedders/
+|   |   |-- base.py
+|   |   |-- local.py              # sentence-transformers (CPU)
+|   |   `-- api.py                # OpenAI-compatible API
+|   |-- rerankers/
+|   |   |-- base.py
+|   |   `-- cross_encoder.py      # CPU cross-encoder
+|   |-- retrievers/
+|   |   |-- base.py
+|   |   |-- faiss_retriever.py    # faiss-cpu IndexFlatIP / HNSW
+|   |   |-- numpy_retriever.py    # Brute-force fallback
+|   |   `-- metadata_store.py     # SQLite metadata/chunk store
+|   |-- pipeline.py               # Orchestrates ingest + retrieve
+|   `-- viewer.py                 # Chunk viewer / semantic search UI
+|-- cli.py                        # CLI entry point (ingest / retrieve / view)
+|-- Dockerfile                    # python:3.11-slim + CPU torch + faiss-cpu
+|-- pyproject.toml
+|-- .env.example
+`-- README.md
 ```
 
 ## Configuration Reference
@@ -182,26 +210,37 @@ All behavior is controlled by `config/default.yaml`:
 
 ```yaml
 parser:
-  pdf_backend: "docling"
-  ocr_enabled: true
-  gpu_batch_size: 16
+  pdf_backend: "pymupdf"
 
 chunker:
   strategy: "recursive"
-  chunk_size: 512
-  chunk_overlap: 64
+  chunk_size: 2048
+  chunk_overlap: 256
+
+quality_filter:
+  enabled: true
+  min_quality_score: 0.3
+  skip_references: true
+  max_url_ratio: 0.5
 
 embedder:
   provider: "local"                    # "local" | "openai"
   model: "nomic-ai/nomic-embed-text-v1.5"
-  device: "cuda"                       # "cuda" | "cpu" | "auto"
-  dimensions: 768                      # can truncate for speed (Matryoshka)
+  device: "cpu"                        # "cpu" | "auto"
+  dimensions: 768
+  batch_size: 32
+
+reranker:
+  enabled: true
+  model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  device: "cpu"                        # "cpu" | "auto"
 
 retriever:
-  backend: "cuvs"
-  algorithm: "cagra"                   # "cagra" | "ivf_pq" | "ivf_flat"
+  backend: "faiss"                     # "faiss" | "numpy"
+  algorithm: "flat"                    # "flat" | "hnsw"
   metric: "cosine"
   top_k: 5
+  min_chunk_length: 128
   index_path: "/data/indexes"
   metadata_db: "/data/metadata.db"
 ```
@@ -210,17 +249,23 @@ retriever:
 
 ```bash
 # Build the container
-docker build -t rag-system .
+docker build -t rag-system-cpu .
 
 # Ingest documents
-docker run --gpus all \
+docker run --rm \
   -v ./data:/data \
   -v ./config:/app/config \
-  rag-system ingest /data/docs/
+  rag-system-cpu ingest /data/docs/
 
 # Retrieve chunks for a query
-docker run --gpus all \
+docker run --rm \
   -v ./data:/data \
   -v ./config:/app/config \
-  rag-system retrieve "What is the main finding?"
+  rag-system-cpu retrieve "What is the main finding?"
+
+# Launch the chunk viewer
+docker run --rm -p 8501:8501 \
+  -v ./data:/data \
+  -v ./config:/app/config \
+  rag-system-cpu view
 ```

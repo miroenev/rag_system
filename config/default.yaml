@@ -15,18 +15,18 @@ quality_filter:
 embedder:
   provider: "local"                    # "local" | "openai"
   model: "nomic-ai/nomic-embed-text-v1.5"
-  device: "cuda"                       # "cuda" | "cpu" | "auto"
+  device: "cpu"                        # "cpu" | "auto"
   dimensions: 768                      # can truncate for speed (Matryoshka)
-  batch_size: 64
+  batch_size: 32                       # CPU: smaller batches work better
 
 reranker:
   enabled: true
   model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
-  device: "cuda"                       # "cuda" | "cpu" | "auto"
+  device: "cpu"                        # "cpu" | "auto"
 
 retriever:
-  backend: "cuvs"
-  algorithm: "cagra"                   # "cagra" | "ivf_pq" | "ivf_flat"
+  backend: "faiss"                     # "faiss" | "numpy"
+  algorithm: "flat"                    # "flat" | "hnsw" (faiss only)
   metric: "cosine"
   top_k: 5
   min_chunk_length: 128

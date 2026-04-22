@@ -62,9 +62,15 @@ class RAGPipeline:
         return CrossEncoderReranker(self._settings.reranker)
 
     def _build_retriever(self):
-        from src.retrievers.cuvs_retriever import CuVSRetriever
+        backend = self._settings.retriever.backend
+        if backend == "numpy":
+            from src.retrievers.numpy_retriever import NumpyRetriever
 
-        return CuVSRetriever(self._settings.retriever, dimension=self._embedder.dimension)
+            return NumpyRetriever(self._settings.retriever, dimension=self._embedder.dimension)
+
+        from src.retrievers.faiss_retriever import FaissRetriever
+
+        return FaissRetriever(self._settings.retriever, dimension=self._embedder.dimension)
 
     def ingest(self, input_path: str | Path) -> int:
         """Ingest documents from a file or directory. Returns number of chunks indexed."""

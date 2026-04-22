@@ -26,7 +26,7 @@ class EmbedderProvider(str, Enum):
 class EmbedderConfig(BaseModel):
     provider: EmbedderProvider = EmbedderProvider.LOCAL
     model: str = "nomic-ai/nomic-embed-text-v1.5"
-    device: Literal["cuda", "cpu", "auto"] = "cuda"
+    device: Literal["cpu", "auto"] = "cpu"
     dimensions: int = Field(default=768, ge=64)
     batch_size: int = Field(default=64, ge=1)
 
@@ -41,18 +41,12 @@ class QualityFilterConfig(BaseModel):
 class RerankerConfig(BaseModel):
     enabled: bool = True
     model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    device: Literal["cuda", "cpu", "auto"] = "cuda"
-
-
-class RetrieverAlgorithm(str, Enum):
-    CAGRA = "cagra"
-    IVF_PQ = "ivf_pq"
-    IVF_FLAT = "ivf_flat"
+    device: Literal["cpu", "auto"] = "cpu"
 
 
 class RetrieverConfig(BaseModel):
-    backend: Literal["cuvs"] = "cuvs"
-    algorithm: RetrieverAlgorithm = RetrieverAlgorithm.CAGRA
+    backend: Literal["faiss", "numpy"] = "faiss"
+    algorithm: Literal["flat", "hnsw"] = "flat"
     metric: Literal["cosine", "l2", "inner_product"] = "cosine"
     top_k: int = Field(default=5, ge=1)
     min_chunk_length: int = Field(default=128, ge=0)
